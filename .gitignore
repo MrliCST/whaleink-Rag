@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# ChromaDB 向量数据库（运行时生成）
+chroma_db/
+
+# IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store
+*.log
+server.log
