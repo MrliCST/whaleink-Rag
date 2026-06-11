@@ -74,6 +74,10 @@ def load_blog_posts(posts_dir: str = None) -> list[Document]:
 
 
 def main():
+    # 阻止 LlamaIndex 内部校验 OpenAI LLM
+    if not os.environ.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = "sk-placeholder-llamaindex"
+
     print("=" * 50)
     print("  whaleink RAG — LlamaIndex 知识库导入")
     print("=" * 50)

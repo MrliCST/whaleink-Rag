@@ -45,12 +45,16 @@ async def lifespan(app: FastAPI):
     logger.info("正在启动 whaleink RAG (LlamaIndex)...")
 
     try:
-        # 只配置 Embedding（LLM 在查询时按需创建，避免模型名校验）
+        # 阻止 LlamaIndex 内部校验 OpenAI LLM
+        if not os.environ.get("OPENAI_API_KEY"):
+            os.environ["OPENAI_API_KEY"] = "sk-placeholder-llamaindex"
+        
+        # 配置 Embedding
         Settings.embed_model = WhaleinkEmbedding()
         
-        # 设一个默认 LLM 避免 LlamaIndex 自动加载 OpenAI（会报错）
+        # 配默认 LLM 避免 LlamaIndex 自动 fallback 到 OpenAI
         from deepseek_llm import DeepSeekLLM
-        Settings.llm = DeepSeekLLM(api_key=os.getenv("DEEPSEEK_API_KEY", "dummy"))
+        Settings.llm = DeepSeekLLM(api_key=os.getenv("DEEPSEEK_API_KEY", "sk-placeholder"))
 
         # 加载已有 ChromaDB 索引
         persist_dir = os.getenv("CHROMA_DB_PATH", "/root/whaleink-rag/chroma_db")
