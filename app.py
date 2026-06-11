@@ -1,5 +1,5 @@
 """
-whaleink RAG — FastAPI 服务
+whaleink RAG — FastAPI + LlamaIndex
 """
 
 import os
@@ -12,19 +12,27 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from llama_index.core import (
+    VectorStoreIndex,
+    StorageContext,
+    Settings,
+)
+from llama_index.vector_stores.chroma import ChromaVectorStore
+import chromadb
+
+from embedding import WhaleinkEmbedding
 
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # ─── 全局状态 ────────────────────────────────────────────
 
 class AppState:
-    vector_store = None
-    embedding_fn = None
+    query_engine = None
     ready = False
-
+    docs_count = 0
 
 state = AppState()
 
@@ -33,42 +41,48 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动时加载向量库"""
-    logger.info("正在启动 whaleink RAG...")
+    """启动时加载索引"""
+    logger.info("正在启动 whaleink RAG (LlamaIndex)...")
 
     try:
-        from rag_pipeline import EmbeddingFunction, VectorStore
+        # 只配置 Embedding（LLM 在查询时按需创建，避免模型名校验）
+        Settings.embed_model = WhaleinkEmbedding()
+        
+        # 设一个默认 LLM 避免 LlamaIndex 自动加载 OpenAI（会报错）
+        from deepseek_llm import DeepSeekLLM
+        Settings.llm = DeepSeekLLM(api_key=os.getenv("DEEPSEEK_API_KEY", "dummy"))
 
-        logger.info("加载 Embedding...")
-        state.embedding_fn = EmbeddingFunction()
+        # 加载已有 ChromaDB 索引
+        persist_dir = os.getenv("CHROMA_DB_PATH", "/root/whaleink-rag/chroma_db")
+        db = chromadb.PersistentClient(path=persist_dir)
 
-        logger.info("连接 ChromaDB...")
-        state.vector_store = VectorStore(embedding_fn=state.embedding_fn)
-
-        count = state.vector_store.count
-        logger.info(f"向量库状态: {count} 个文档块")
-
-        if count == 0:
-            logger.warning("⚠️  向量库为空！请先运行: python ingest.py")
-        else:
-            state.ready = True
-            logger.info("✅ whaleink RAG 就绪")
+        try:
+            chroma_collection = db.get_collection("whaleink_blog")
+            vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+            index = VectorStoreIndex.from_vector_store(vector_store)
+            state.query_engine = index.as_query_engine(
+                similarity_top_k=3,
+                response_mode="compact",
+            )
+            state.docs_count = chroma_collection.count()
+            state.ready = state.docs_count > 0
+            logger.info(f"✅ 加载索引: {state.docs_count} 个文档块")
+        except Exception as e:
+            logger.warning(f"⚠️  加载索引失败: {e}")
 
     except Exception as e:
         logger.error(f"启动失败: {e}")
-        logger.warning("服务将以降级模式运行（仅返回错误信息）")
 
     yield
-
     logger.info("whaleink RAG 已关闭")
 
 
 # ─── FastAPI 应用 ────────────────────────────────────────
 
 app = FastAPI(
-    title="whaleink RAG API",
-    description="whaleink.top 博客 AI 问答助手",
-    version="1.0.0",
+    title="whaleink RAG API (LlamaIndex)",
+    description="whaleink.top 博客 AI 问答助手 — 基于 LlamaIndex",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -86,57 +100,74 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str
 
-
 class QueryResponse(BaseModel):
     answer: str
     sources: list[str] = []
-
 
 class StatusResponse(BaseModel):
     status: str
     docs_count: int
     version: str
+    framework: str = "LlamaIndex"
 
 
 # ─── API 路由 ────────────────────────────────────────────
 
 @app.get("/", tags=["系统"])
 async def root():
-    """欢迎页"""
     return {
         "name": "whaleink RAG API",
+        "version": "2.0.0",
+        "framework": "LlamaIndex",
         "status": "ready" if state.ready else "degraded",
-        "docs_count": state.vector_store.count if state.vector_store else 0,
+        "docs_count": state.docs_count,
     }
 
 
 @app.get("/api/status", response_model=StatusResponse, tags=["系统"])
 async def get_status():
-    """获取服务状态"""
     return StatusResponse(
         status="ready" if state.ready else "degraded",
-        docs_count=state.vector_store.count if state.vector_store else 0,
-        version="1.0.0",
+        docs_count=state.docs_count,
+        version="2.0.0",
     )
 
 
 @app.post("/api/query", response_model=QueryResponse, tags=["RAG"])
 async def query(req: QueryRequest):
-    """RAG 问答"""
-    if not state.ready:
+    if not state.ready or not state.query_engine:
         raise HTTPException(
             status_code=503,
-            detail="知识库未就绪，请先运行 python ingest.py 导入数据",
+            detail="知识库未就绪，请先运行 python ingest.py",
         )
 
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
 
-    from rag_pipeline import query_rag
-
     try:
-        result = query_rag(req.question, state.vector_store)
-        return QueryResponse(answer=result["answer"], sources=result["sources"])
+        from deepseek_llm import DeepSeekLLM
+        
+        deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+        if deepseek_key:
+            Settings.llm = DeepSeekLLM(
+                api_key=deepseek_key,
+            )
+        
+        response = state.query_engine.query(req.question)
+
+        # 提取来源
+        sources = []
+        if hasattr(response, "source_nodes") and response.source_nodes:
+            for sn in response.source_nodes:
+                meta = sn.node.metadata
+                title = meta.get("title", "")
+                if title and title not in sources:
+                    sources.append(title)
+
+        return QueryResponse(
+            answer=str(response),
+            sources=sources,
+        )
     except Exception as e:
         logger.error(f"查询失败: {e}")
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
@@ -145,21 +176,25 @@ async def query(req: QueryRequest):
 @app.post("/api/reload", tags=["管理"])
 async def reload_knowledge():
     """重新加载知识库（需要先运行 ingest.py）"""
-    from rag_pipeline import EmbeddingFunction, VectorStore
-
     try:
-        state.embedding_fn = EmbeddingFunction()
-        state.vector_store = VectorStore(embedding_fn=state.embedding_fn)
-        state.ready = state.vector_store.count > 0
+        persist_dir = os.getenv("CHROMA_DB_PATH", "/root/whaleink-rag/chroma_db")
+        db = chromadb.PersistentClient(path=persist_dir)
+        chroma_collection = db.get_collection("whaleink_blog")
+        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+        index = VectorStoreIndex.from_vector_store(vector_store)
+        state.query_engine = index.as_query_engine(similarity_top_k=3)
+        state.docs_count = chroma_collection.count()
+        state.ready = state.docs_count > 0
         return {
             "status": "reloaded",
-            "docs_count": state.vector_store.count,
+            "docs_count": state.docs_count,
+            "framework": "LlamaIndex",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── 静态文件（前端） ──────────────────────────────────────
+# ─── 静态文件 ────────────────────────────────────────────
 
 static_dir = Path(__file__).parent / "static"
 static_dir.mkdir(exist_ok=True)
@@ -170,6 +205,5 @@ app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
